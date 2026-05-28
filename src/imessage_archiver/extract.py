@@ -2,6 +2,7 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timezone
+from tqdm import tqdm
 from . import attachments as att_mod
 from . import config, contacts
 from .attributed_body import extract_text
@@ -34,11 +35,9 @@ def run() -> dict:
     conn.row_factory = sqlite3.Row
 
     # --- Build attachment lookups ---
-    print("  Building Manifest.db lookup...")
     manifest_lookup = att_mod.build_manifest_lookup()
-    print(f"  Loaded {len(manifest_lookup)} Manifest entries")
     attachments_by_msg = att_mod.query_message_attachments(conn)
-    print(f"  Found attachments for {len(attachments_by_msg)} messages")
+    print(f"  Manifest: {len(manifest_lookup)} entries, {len(attachments_by_msg)} messages have attachments")
 
     # --- Build participant map: chat_id → list of {handle, name} ---
     participants: dict[int, list[dict]] = {}
@@ -107,7 +106,8 @@ def run() -> dict:
         "failed_mimes": {},
     }
 
-    for row in rows:
+    bar = tqdm(rows, desc="  Processing", unit="msg", dynamic_ncols=True)
+    for row in bar:
         chat_id = row["chat_id"]
         if chat_id not in chats_raw:
             parts = participants.get(chat_id, [])
@@ -183,6 +183,11 @@ def run() -> dict:
             "attachments": msg_attachments,
         }
         chats_raw[chat_id]["messages"].append(msg)
+
+        if stats["total_messages"] % 200 == 0:
+            bar.set_postfix(att_copied=stats["copied"], att_missing=stats["missing_in_backup"])
+
+    bar.set_postfix(att_copied=stats["copied"], att_missing=stats["missing_in_backup"])
 
     # Serialise — one file per conversation
     conversations = list(chats_raw.values())

@@ -5,6 +5,20 @@ import sqlite3
 from pathlib import Path
 from . import config
 
+_HEIC_SUFFIXES = {".heic", ".heif"}
+
+
+def _register_heif() -> bool:
+    try:
+        import pillow_heif
+        pillow_heif.register_heif_opener()
+        return True
+    except ImportError:
+        return False
+
+
+_HEIF_AVAILABLE = _register_heif()
+
 
 def build_manifest_lookup() -> dict[str, str]:
     """Return {relativePath → fileID} for all MediaDomain entries in Manifest.db."""
@@ -50,13 +64,36 @@ def _backup_path_for(file_id: str) -> Path:
     return config.DEVICE_DIR / file_id[:2] / file_id
 
 
-def _copy_attachment(src: Path, dest: Path) -> bool:
-    """Copy src → dest if dest is missing or size differs. Returns True if a copy was made."""
-    if dest.exists() and dest.stat().st_size == src.stat().st_size:
-        return False
+def _copy_attachment(src: Path, dest: Path) -> tuple[bool, Path]:
+    """Copy (or convert) src → dest. Returns (was_new_copy, actual_dest_path).
+
+    HEIC/HEIF files are converted to JPEG so browsers can display them inline.
+    The returned dest path may differ from the input (extension changed to .jpg).
+    """
+    is_heic = dest.suffix.lower() in _HEIC_SUFFIXES and _HEIF_AVAILABLE
+    if is_heic:
+        dest = dest.with_suffix(".jpg")
+
+    if dest.exists() and dest.stat().st_size > 0:
+        return False, dest
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    return True
+
+    if is_heic:
+        from PIL import Image
+        try:
+            img = Image.open(src)
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            img.save(dest, "JPEG", quality=88)
+        except Exception as exc:
+            print(f"  [warn] HEIC conversion failed for {dest.stem}: {exc} — copying as-is")
+            dest = dest.with_suffix(".heic")
+            shutil.copy2(src, dest)
+    else:
+        shutil.copy2(src, dest)
+
+    return True, dest
 
 
 def _sanitize_dest_name(transfer_name: str, rowid: int) -> str:
@@ -73,6 +110,10 @@ def process_attachment(att_row, conv_folder_name: str, manifest_lookup: dict, st
     transfer_name = att_row["transfer_name"] or f"attachment_{rowid}"
 
     stats["total_attachments"] += 1
+
+    if (mime_type or "").startswith("video/"):
+        stats["skipped_video"] = stats.get("skipped_video", 0) + 1
+        return {"path": None, "mime_type": mime_type, "transfer_name": transfer_name, "status": "skipped"}
 
     dest_name = _sanitize_dest_name(transfer_name, rowid)
     rel_path = f"attachments/{conv_folder_name}/{dest_name}"
@@ -115,7 +156,7 @@ def process_attachment(att_row, conv_folder_name: str, manifest_lookup: dict, st
             return result
 
     try:
-        copied = _copy_attachment(backup_path, dest)
+        copied, actual_dest = _copy_attachment(backup_path, dest)
     except OSError as exc:
         stats["copy_errors"] += 1
         stats["failed_mimes"][mime_type or "(null)"] = (
@@ -124,6 +165,11 @@ def process_attachment(att_row, conv_folder_name: str, manifest_lookup: dict, st
         result["status"] = "copy_error"
         result["error"] = str(exc)
         return result
+
+    # If HEIC was converted to JPEG, update path and mime_type in the result
+    if actual_dest != dest:
+        result["path"] = f"attachments/{conv_folder_name}/{actual_dest.name}"
+        result["mime_type"] = "image/jpeg"
 
     if copied:
         stats["copied"] += 1
