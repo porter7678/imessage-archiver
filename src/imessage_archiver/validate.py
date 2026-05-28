@@ -54,3 +54,59 @@ def run(stats: dict):
     print(f"\nJSON index:      {cfg.JSON_INDEX}")
     print(f"Conversations:   {cfg.JSON_CONVERSATIONS_DIR}/")
     print("=" * 60 + "\n")
+
+
+def run_milestone2(stats: dict):
+    from . import config
+
+    total = stats.get("total_attachments", 0)
+    copied = stats.get("copied", 0)
+    skipped = stats.get("skipped_existing", 0)
+    missing = stats.get("missing_in_backup", 0)
+    not_media = stats.get("not_in_media_domain", 0)
+    fallback = stats.get("sha1_fallback", 0)
+    errors = stats.get("copy_errors", 0)
+    bytes_copied = stats.get("bytes_copied", 0)
+
+    print("=" * 60)
+    print("MILESTONE 2 VALIDATION REPORT")
+    print("=" * 60)
+    print(f"\nTotal attachments in sms.db:  {total}")
+    print(f"  Copied to output:           {copied}")
+    print(f"  Skipped (already exists):   {skipped}")
+    print(f"  Missing in backup:          {missing}")
+    print(f"  Not in MediaDomain (temp):  {not_media}")
+    print(f"  Resolved via SHA1 fallback: {fallback}")
+    print(f"  Copy errors:                {errors}")
+    mb = bytes_copied / 1_048_576
+    print(f"\nTotal bytes copied:           {mb:.1f} MB")
+
+    failed_mimes = stats.get("failed_mimes", {})
+    if failed_mimes:
+        print("\n--- MIME types of unresolved attachments ---")
+        for mime, count in sorted(failed_mimes.items(), key=lambda x: -x[1]):
+            print(f"  {mime:<50s}  {count}")
+    else:
+        print("\nNo unresolved MIME types.")
+
+    print("\n--- Sample resolved attachments (first image-bearing conversation) ---")
+    shown_convs = 0
+    for conv in stats.get("conversations_raw", []):
+        att_msgs = [m for m in conv["messages"] if any(
+            a.get("status") == "copied" for a in m.get("attachments", [])
+        )]
+        if not att_msgs:
+            continue
+        print(f"\n  {conv['title']!r} ({len(att_msgs)} messages with attachments)")
+        for msg in att_msgs[:3]:
+            for att in msg["attachments"]:
+                if att.get("status") == "copied":
+                    full = config.OUTPUT_ROOT / att["path"]
+                    size = full.stat().st_size if full.exists() else -1
+                    print(f"    {att['path']}  mime={att['mime_type']}  size={size}B")
+        shown_convs += 1
+        if shown_convs >= 2:
+            break
+
+    print(f"\nAttachments dir: {config.OUTPUT_ATTACHMENTS_DIR}/")
+    print("=" * 60 + "\n")

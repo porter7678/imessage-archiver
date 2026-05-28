@@ -16,6 +16,7 @@ OUTPUT_ROOT = Path("/mnt/d/iMessageExport")
 JSON_DIR = OUTPUT_ROOT / "json"
 JSON_INDEX = JSON_DIR / "index.json"
 JSON_CONVERSATIONS_DIR = JSON_DIR / "conversations"
+OUTPUT_ATTACHMENTS_DIR = OUTPUT_ROOT / "attachments"
 
 SCRATCH_SMS_DB = SCRATCH_DIR / "sms.db"
 SCRATCH_MANIFEST_DB = SCRATCH_DIR / "Manifest.db"

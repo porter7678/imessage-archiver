@@ -1,6 +1,8 @@
 import json
+import re
 import sqlite3
 from datetime import datetime, timezone
+from . import attachments as att_mod
 from . import config, contacts
 from .attributed_body import extract_text
 
@@ -19,11 +21,24 @@ def _cocoa_to_iso(date_val: int | None) -> str | None:
     return datetime.fromtimestamp(unix).astimezone().isoformat()
 
 
+def _safe_filename(title: str) -> str:
+    slug = re.sub(r"[^\w\s-]", "", title).strip()
+    slug = re.sub(r"[\s]+", "_", slug)
+    return slug[:60] or "untitled"
+
+
 def run() -> dict:
-    """Extract all conversations from sms.db. Returns stats dict for validate.py."""
+    """Extract all conversations from sms.db with attachment resolution. Returns stats dict."""
     db_uri = f"file:{config.SCRATCH_SMS_DB}?mode=ro"
     conn = sqlite3.connect(db_uri, uri=True)
     conn.row_factory = sqlite3.Row
+
+    # --- Build attachment lookups ---
+    print("  Building Manifest.db lookup...")
+    manifest_lookup = att_mod.build_manifest_lookup()
+    print(f"  Loaded {len(manifest_lookup)} Manifest entries")
+    attachments_by_msg = att_mod.query_message_attachments(conn)
+    print(f"  Found attachments for {len(attachments_by_msg)} messages")
 
     # --- Build participant map: chat_id → list of {handle, name} ---
     participants: dict[int, list[dict]] = {}
@@ -72,14 +87,24 @@ def run() -> dict:
 
     # --- Group by chat ---
     chats_raw: dict[int, dict] = {}
-    stats = {
+    stats: dict = {
         "total_messages": 0,
         "text_source_text": 0,
         "text_source_attributed": 0,
         "text_source_empty": 0,
-        "empty_confirmed_blank": 0,   # attributedBody present but zero-length NSString
-        "empty_both_null": 0,          # both text and attributedBody are NULL
+        "empty_confirmed_blank": 0,
+        "empty_both_null": 0,
         "unresolved_handles": set(),
+        # attachment stats (populated by attachments.process_attachment)
+        "total_attachments": 0,
+        "copied": 0,
+        "skipped_existing": 0,
+        "missing_in_backup": 0,
+        "not_in_media_domain": 0,
+        "sha1_fallback": 0,
+        "copy_errors": 0,
+        "bytes_copied": 0,
+        "failed_mimes": {},
     }
 
     for row in rows:
@@ -95,14 +120,18 @@ def run() -> dict:
             else:
                 title = row["chat_identifier"] or f"chat_{chat_id}"
 
+            folder_name = f"{chat_id:04d}_{_safe_filename(title)}"
             chats_raw[chat_id] = {
                 "chat_id": chat_id,
                 "chat_identifier": row["chat_identifier"],
                 "title": title,
                 "style": "group" if row["chat_style"] == 43 else "1-on-1",
                 "participants": parts,
+                "folder_name": folder_name,
                 "messages": [],
             }
+
+        folder_name = chats_raw[chat_id]["folder_name"]
 
         # Resolve message text
         raw_text = row["text"]
@@ -135,6 +164,12 @@ def run() -> dict:
             if sender_handle and not contacts.resolve(sender_handle):
                 stats["unresolved_handles"].add(sender_handle)
 
+        # Resolve attachments for this message
+        msg_attachments = []
+        for att_row in attachments_by_msg.get(row["msg_id"], []):
+            att_dict = att_mod.process_attachment(att_row, folder_name, manifest_lookup, stats)
+            msg_attachments.append(att_dict)
+
         msg = {
             "timestamp": _cocoa_to_iso(row["date"]),
             "sender_name": sender_name,
@@ -145,18 +180,11 @@ def run() -> dict:
             "item_type": row["item_type"],
             "cache_has_attachments": bool(row["cache_has_attachments"]),
             "service": row["service"],
-            "attachments": [],
+            "attachments": msg_attachments,
         }
         chats_raw[chat_id]["messages"].append(msg)
 
     # Serialise — one file per conversation
-    import re
-
-    def _safe_filename(title: str) -> str:
-        slug = re.sub(r"[^\w\s-]", "", title).strip()
-        slug = re.sub(r"[\s]+", "_", slug)
-        return slug[:60] or "untitled"
-
     conversations = list(chats_raw.values())
     config.JSON_CONVERSATIONS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -166,10 +194,13 @@ def run() -> dict:
             {k: v for k, v in m.items() if k != "text_source"}
             for m in conv["messages"]
         ]
-        conv_out = {**conv, "messages": messages_clean}
-
-        filename = f"{conv['chat_id']:04d}_{_safe_filename(conv['title'])}.json"
+        filename = f"{conv['folder_name']}.json"
+        conv_out = {
+            k: v for k, v in conv.items() if k != "folder_name"
+        }
+        conv_out["messages"] = messages_clean
         conv_out["filename"] = filename
+
         path = config.JSON_CONVERSATIONS_DIR / filename
         with open(path, "w", encoding="utf-8") as f:
             json.dump(conv_out, f, indent=2, ensure_ascii=False)
